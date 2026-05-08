@@ -215,3 +215,5 @@ samples 100% sample-for-sample matched.
 - **[`setup_scripts/README.md`](setup_scripts/README.md)** — host BLE pairing.
 - **[`samples/README.md`](samples/README.md)** — demo-capture corpus.
 - **[`fixtures/README.md`](fixtures/README.md)** — regression-test fixtures.
+## License Information
+This project is licensed under the GNU General Public License version 3. See the LICENSE file for details.
