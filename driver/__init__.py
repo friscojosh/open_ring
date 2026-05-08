@@ -2,13 +2,13 @@
 
 Public API:
 
-    from oura_ring import Record, decode, replay
-    from oura_ring.framing import parse_inner_records, parse_outer_frames
+    from driver import Record, decode, replay
+    from driver.framing import parse_inner_records, parse_outer_frames
 
 For now the live BLE transport is a TODO; offline replay against btsnoop logs
 is the supported entry point:
 
-    python -m oura_ring.cli sunday_evening.log
+    python -m driver.cli sunday_evening.log
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from .framing import (
     parse_inner_records,
     looks_like_outer_frame,
 )
-from .persistence import CursorStore
+from .persistence import SyncState, CursorStore  # CursorStore = back-compat alias for SyncState
 from .replay import replay
 from .state import RingState, ClientState
 from . import realm_dump
@@ -40,7 +40,8 @@ __all__ = [
     "replay",
     "RingState",
     "ClientState",
-    "CursorStore",
+    "SyncState",
+    "CursorStore",  # deprecated alias
 ]
 
 __version__ = "0.1.0"

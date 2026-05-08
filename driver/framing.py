@@ -52,9 +52,38 @@ class OuterFrame:
 @dataclass
 class InnerRecord:
     type_byte: int
-    counter: int             # uint16 LE
-    session: int             # uint16 LE
+    counter: int             # uint16 LE — low 16 bits of ring_time
+    session: int             # uint16 LE — high 16 bits of ring_time
     payload: bytes           # bytes after the 4-byte ctr+sess header
+
+    @property
+    def ring_time(self) -> int:
+        """The 32-bit `ringTimestamp` for this record. The TLV's `(counter,
+        session)` pair is actually one u32 stored little-endian: low 16 bits
+        in `counter`, high 16 bits in `session`. Verified empirically against
+        `monday_morning_wk2.log` — the first record after a `GetEvent(T)`
+        request has `ring_time == T`, and the value advances monotonically
+        across all records in the stream regardless of type.
+
+        IMPORTANT — this is NOT a wall-clock timestamp despite the name.
+        The official app's `GetEvent.java` calls it `eventStartTimestamp`,
+        but empirically it's a per-stream event-sequence counter: it
+        increments by 1 each time the ring emits a streamable event,
+        regardless of how much real time has passed. Concretely:
+
+          - Default mode: exactly 10 ticks/sec = 100 ms/tick. Verified
+            against the native `RingTimeResolver::to_utc` which uses a
+            constant factor of 100 ms per tick.
+          - Burst/extended mode: 1 ms/tick (1 kHz). Ring signals this via a
+            `0xfd` token in the next 0x42 (TimeSyncInd) anchor, which sets
+            `factor_flag=1` in the native anchor struct.
+          - 5839 ring_time units between two records ≈ 583.9 s in default
+            mode (10 ticks/sec).
+
+        Use it as a monotonic cursor for `request_events_since(...)` and as
+        a sequence comparator. Don't multiply by anything to get seconds.
+        """
+        return (self.session << 16) | self.counter
 
 
 def parse_outer_frames(value: bytes) -> list[OuterFrame]:
@@ -77,7 +106,17 @@ def parse_outer_frames(value: bytes) -> list[OuterFrame]:
 
 
 def parse_inner_records(value: bytes) -> list[InnerRecord]:
-    """Return zero or more inner records concatenated into one notification."""
+    """Return zero or more inner records concatenated into one notification.
+
+    Stops parsing only when the bytes can't form a complete TLV record
+    (truncated body, or `ln < 4` so there's no room for the standard
+    ringTimestamp header). Records that ARE structurally complete but
+    semantically suspect (e.g. `0x33` with the wrong length, or any
+    `UNKNOWN_*` type byte) are still emitted — downstream consumers
+    distinguish trustworthy records from misparse fragments via
+    `decoders.is_structurally_unknown`. Emitting them keeps the record
+    count transparent and lets callers see what the framing layer saw.
+    """
     out: list[InnerRecord] = []
     i = 0
     while i + 2 <= len(value):

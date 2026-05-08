@@ -325,8 +325,9 @@ class ClientState:
     # On every reconnect, the driver requests history with a delta-sync cursor.
     # We track per-sub-op cursors so consumers can verify "we've caught up".
     history_fetch_count: int = 0
-    history_fetch_full_sync_count: int = 0    # cursor=0 (full re-sync)
-    last_history_cursor_by_subop: dict[int, int] = field(default_factory=dict)
+    history_fetch_full_sync_count: int = 0    # ring_timestamp=0 (full re-sync)
+    last_history_ring_timestamp: int = 0      # latest cursor we've requested
+    last_history_response_ts: int = 0         # last_ring_timestamp from `0x11` resp
 
     # Per-record-type coverage: count + last (counter, session) seen.
     # Lets consumers detect when records are missed (counter gaps).
@@ -398,26 +399,21 @@ class ClientState:
             return
 
         # ---- Autonomous catch-up plane ----
+        # History fetch is keyed by a single 32-bit `ring_timestamp` cursor
+        # (NOT a sub_op→cursor map; see PROTOCOL.md §6.4 / persistence.py
+        # §"Format v4"). Persistent cross-session cursor lives in SyncState.
         if rec.type == "_HISTORY_FETCH_REQ":
             self.history_fetch_count += 1
             if rec.data.get("is_full_sync"):
                 self.history_fetch_full_sync_count += 1
-            sub_op = rec.data["sub_op"]
-            cur = rec.data["cursor"]
-            # Only advance forward — a regression here means a full re-sync
-            # request, not an actual position move. Persist via CursorStore;
-            # see oura_ring.persistence for the file-backed accessor.
-            if cur > self.last_history_cursor_by_subop.get(sub_op, 0):
-                self.last_history_cursor_by_subop[sub_op] = cur
+            ts = rec.data.get("ring_timestamp")
+            if isinstance(ts, int) and ts > self.last_history_ring_timestamp:
+                self.last_history_ring_timestamp = ts
             return
         if rec.type == "_HISTORY_FETCH_RESP":
-            sub_op = rec.data.get("sub_op")
-            cur = rec.data.get("cursor")
-            if sub_op is not None and cur is not None:
-                # The ring's reported end-of-buffer position — the value we
-                # should save and use as `cursor` on the next request.
-                if cur > self.last_history_cursor_by_subop.get(sub_op, 0):
-                    self.last_history_cursor_by_subop[sub_op] = cur
+            ts = rec.data.get("last_ring_timestamp")
+            if isinstance(ts, int) and ts > self.last_history_response_ts:
+                self.last_history_response_ts = ts
             return
 
         # ---- Control plane ----

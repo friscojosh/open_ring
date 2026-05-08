@@ -11,7 +11,7 @@ import sys
 from collections.abc import Iterator
 from pathlib import Path
 
-from .decoders import CvaPpgDecoder, canonical_type, decode
+from .decoders import CvaPpgDecoder, canonical_type, decode, is_structurally_unknown
 from .envelope import Record
 from .framing import (
     OPCODES,
@@ -77,6 +77,13 @@ def replay(
     cva_ppg_dec = CvaPpgDecoder()
     cva_ppg_last_t: int | None = None
 
+    # Transient anchor for ring_time→utc interpolation. Mirrors the live
+    # transport's anchor logic (RingTimeResolver from libappecore.so) but
+    # in-memory only — replay is read-only and cross-session anchor
+    # persistence isn't meaningful here.
+    from .persistence import SyncState
+    anchor_state = SyncState(path="/dev/null")  # not loaded, not saved
+
     for ts_seconds, pkt in btsnoop_packets(path):
         parsed = parse_att(pkt)
         if not parsed:
@@ -105,7 +112,35 @@ def replay(
             if direction != "ring":
                 continue
             for r in parse_inner_records(value):
-                data = decode(r.type_byte, r.payload)
+                if r.type_byte == 0x33:
+                    # 0x33 framing puts data in the (ctr,sess) bytes —
+                    # reconstruct the full body for decoding.
+                    from .decoders import decode_unknown_33_body
+                    import struct as _struct
+                    try:
+                        _body = (_struct.pack('<HH', r.counter, r.session)
+                                 + r.payload)
+                        data = decode_unknown_33_body(_body)
+                    except (ValueError, _struct.error) as _e:
+                        data = {"_decode_error": str(_e),
+                                "hex": r.payload.hex(),
+                                "len": len(r.payload)}
+                else:
+                    data = decode(r.type_byte, r.payload)
+                if (r.type_byte == 0x42
+                        and 0 < r.ring_time < 0x80000000):
+                    unix_s = data.get("ring_unix_time_approx_s")
+                    if isinstance(unix_s, int) and unix_s > 0:
+                        anchor_state.update_anchor(
+                            ring_time=r.ring_time,
+                            utc_ms=unix_s * 1000,
+                            factor_flag=1 if data.get("token") == 0xfd else 0,
+                            validate_against_now=False,
+                        )
+                elif (r.type_byte == 0x41
+                        and anchor_state.anchor_ring_time != 0
+                        and r.ring_time < anchor_state.anchor_ring_time):
+                    anchor_state.invalidate_anchor()
                 if r.type_byte == 0x81:
                     if cva_ppg_last_t is not None and (utc_ms - cva_ppg_last_t) > 60_000:
                         cva_ppg_dec.reset()
@@ -118,14 +153,19 @@ def replay(
                         "session_deltas": cva_ppg_dec.deltas_total,
                     }
                     cva_ppg_last_t = utc_ms
+                t_event_ms = (anchor_state.to_utc_ms(r.ring_time)
+                              if (0 < r.ring_time < 0x80000000
+                                  and not is_structurally_unknown(r.type_byte))
+                              else None)
                 yield Record(
                     t=utc_ms,
-                    rt=None,                # ring_time isn't in the inner-record TLV
+                    rt=r.ring_time,         # (session<<16)|counter — verified
                     ctr=r.counter,
                     sess=r.session,
                     tag=f"0x{r.type_byte:02x}",
                     type=canonical_type(r.type_byte),
                     data=data,
+                    t_event_ms=t_event_ms,
                 )
 
 
@@ -213,23 +253,37 @@ def _outer_to_record(f, direction: str, utc_ms: int) -> Record | None:
             data={"status": f.raw[2]},
         )
 
-    # ----- Catch-up plane: history fetch (delta-sync cursor)
-    # Phone → Ring: 10 09 <subop:1> <cursor:3 LE> 00 ff ff ff ff ff
+    # ----- Catch-up plane: GetEvent (history fetch by ring_timestamp)
+    # Phone → Ring: 10 09 <ring_timestamp:4 LE> <max_events:1> <flags:4 LE>
+    # Verified against `GetEvent.java` REQUEST_TAG=0x10 in the official app.
+    # max_events=0 acts as a cursor-advance ack with no expected data.
     if op == 0x10 and direction == "phone" and len(f.raw) == 11:
-        cursor = f.raw[3] | (f.raw[4] << 8) | (f.raw[5] << 16)
+        ring_ts = (f.raw[2] | (f.raw[3] << 8)
+                   | (f.raw[4] << 16) | (f.raw[5] << 24))
+        max_events = f.raw[6]
+        flags = (f.raw[7] | (f.raw[8] << 8)
+                 | (f.raw[9] << 16) | (f.raw[10] << 24))
         return Record(
             t=utc_ms, rt=None, ctr=None, sess=None,
             tag="_HISTORY_FETCH_REQ", type="_HISTORY_FETCH_REQ",
-            data={"sub_op": f.raw[2], "cursor": cursor,
-                  "is_full_sync": cursor == 0},
+            data={"ring_timestamp": ring_ts, "max_events": max_events,
+                  "flags": flags, "is_ack_only": max_events == 0,
+                  "is_full_sync": ring_ts == 0},
         )
-    # Ring → Phone: 11 09 <subop:1> <cursor:3 LE> ...
-    if op == 0x11 and direction == "ring" and len(f.raw) >= 6:
-        cursor = f.raw[3] | (f.raw[4] << 8) | (f.raw[5] << 16)
+    # Ring → Phone: 11 <len> <status:1> <sub_status:1> <last_ring_timestamp:4 LE> ...
+    # Per `GetEvent.parseResponse`: status==0xff means data follows; status==0
+    # means empty. last_ring_timestamp is the highest event timestamp the ring
+    # delivered in this batch — phone uses it to advance its sync cursor.
+    if op == 0x11 and direction == "ring" and len(f.raw) >= 8:
+        status = f.raw[2]
+        sub_status = f.raw[3]
+        ts = (f.raw[4] | (f.raw[5] << 8)
+              | (f.raw[6] << 16) | (f.raw[7] << 24))
         return Record(
             t=utc_ms, rt=None, ctr=None, sess=None,
             tag="_HISTORY_FETCH_RESP", type="_HISTORY_FETCH_RESP",
-            data={"sub_op": f.raw[2], "cursor": cursor},
+            data={"status": status, "sub_status": sub_status,
+                  "last_ring_timestamp": ts},
         )
 
     # ----- Control plane: parameter RPC (0x2F sub-ops 0x20/0x21/0x22/0x26/0x28)

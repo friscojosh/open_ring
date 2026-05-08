@@ -28,6 +28,7 @@ RING_EVENT_TYPE: dict[int, str] = {
     0x52: "API_ACTIVITY_SUMMARY_2",
     0x53: "API_WEAR_EVENT",
     0x54: "API_RECOVERY_SUMMARY",
+    0x56: "(not_in_enum_56)",
     0x5b: "API_BLE_CONNECTION_IND",
     0x5c: "API_USER_INFO",
     0x5d: "API_HRV_EVENT",
@@ -55,7 +56,7 @@ RING_EVENT_TYPE: dict[int, str] = {
     0x81: "API_CVA_RAW_PPG_DATA",
     0x82: "API_SCAN_START",
     0x83: "API_SCAN_END",
-    0x85: "(not_in_enum_85)",
+    0x85: "API_RTC_BEACON_IND",
 }
 
 

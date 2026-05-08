@@ -476,6 +476,85 @@ def decode_selftest_event(p: bytes) -> dict[str, Any]:
     }
 
 
+def decode_unknown_33_body(body: bytes) -> dict[str, Any]:
+    """0x33 — confirmed real wire tag (240 occurrences in sunday_evening.log,
+    each a 16-byte notification starting `33 0e ...`), but it does NOT use
+    the standard `(counter, session) = ringTimestamp` framing. Bytes 0-3 of
+    the body are sensor data, not timestamp.
+
+    Layout (14-byte body, after the type+len TLV header):
+        byte 0     : sub_op                 0x31 or 0x32 (two interleaved
+                                            streams; possibly L/R hand or
+                                            two sensor channels)
+        byte 1     : seq                    per-sub_op sequence counter
+        bytes 2-13 : six i16 LE samples     two 3-axis sensor samples
+
+    Empirics from sunday_evening.log: 240 records over 9.7 s = 24.7
+    records/sec, each with 2 samples → ~50 Hz sensor rate; one channel
+    (ch_z below) has a ~-450 LSB offset (likely gravity), the other two
+    are zero-mean — consistent with a 3-axis accelerometer or motion
+    sensor at low scale. 210 records use sub_op=0x31, 30 use 0x32.
+
+    The standard `decode()` API takes `payload` (= body[4:14]) which loses
+    the (sub_op, seq) header and the first sample's first channel.
+    Consumers must call this directly with the full 14-byte body
+    reconstructed as `struct.pack('<HH', counter, session) + payload`.
+    """
+    if len(body) != 14:
+        raise ValueError(f"Unknown33 body length {len(body)}, expected 14")
+    sub_op = body[0]
+    seq = body[1]
+    s = struct.unpack_from("<6h", body, 2)
+    return {
+        "sub_op": sub_op,
+        "seq": seq,
+        "samples": [
+            {"x": s[0], "y": s[1], "z": s[2]},
+            {"x": s[3], "y": s[4], "z": s[5]},
+        ],
+        "_decoder": "unknown_33_body",
+        "_note": ("ringTimestamp framing not used by this record type; "
+                  "(ctr,sess) bytes carry data not timestamp"),
+    }
+
+
+def decode_unknown_56(p: bytes) -> dict[str, Any]:
+    """0x56 — confirmed real wire tag. 1-byte payload (the standard TLV
+    framing IS used: ringTimestamp at body[0..4] is sequentially-correct
+    against neighboring records, only the after-header payload is 1 byte).
+
+    Empirically (4 occurrences across 4 distinct captures): payload is
+    always `0x01`, and the record always sits at ctr=N+1 between a
+    `0x50 API_ACTIVITY_INFO` (ctr=N) and a `0x47 API_MOTION_EVENT`
+    (ctr=N+2) within the same session. Likely an activity-state-change
+    flag or motion-trigger marker. Semantics not yet identified.
+    """
+    if len(p) != 1:
+        raise ValueError(f"Unknown56 payload length {len(p)}, expected 1")
+    return {"flag": p[0]}
+
+
+def decode_unknown_85(p: bytes) -> dict[str, Any]:
+    """0x85 — unnamed in the official app's `RingEventType` enum but emitted
+    on the wire. Empirically (16 samples across May 2-6 2026, multiple files)
+    every payload is exactly 10 bytes shaped `<unix_s:u32 LE><00 00 00 00><trailer:u16>`.
+
+    Bytes 0-3 are the ring's RTC at event time: payload `unix_s` is always
+    `<=` driver receive time, with deltas ranging from -16 s (live) to
+    -49 820 s (~13.8 h catchup) — consistent with buffer-then-dump behavior.
+    Bytes 4-7 were zero in every observed sample. Bytes 8-9 alternate
+    between 0x01f6 and 0x01f8 (LE u16 = 502 / 504); semantics unknown,
+    exposed as `trailer_hex` for downstream analysis.
+    """
+    if len(p) != 10:
+        raise ValueError(f"Unknown85 payload length {len(p)}, expected 10")
+    return {
+        "unix_time_s": struct.unpack_from("<I", p, 0)[0],
+        "reserved": p[4:8].hex(),
+        "trailer_hex": p[8:10].hex(),
+    }
+
+
 def decode_feature_session(p: bytes) -> dict[str, Any]:
     """0x6c — variable size (3..7 observed); first 3 bytes are header
     (some_byte, capability, status). The remainder is one of 12 session-type
@@ -1478,6 +1557,8 @@ DECODERS: dict[int, Callable[[bytes], dict[str, Any]]] = {
     0x80: decode_green_ibi_quality_event,
     0x82: decode_scan_start,
     0x83: decode_scan_end,
+    0x56: decode_unknown_56,
+    0x85: decode_unknown_85,
 
     # Generic/passthrough (no parser symbol or low-priority)
     0x5c: decode_user_info,
@@ -1502,3 +1583,20 @@ def decode(type_byte: int, payload: bytes) -> dict[str, Any]:
 
 def canonical_type(type_byte: int) -> str:
     return RING_EVENT_TYPE.get(type_byte, f"UNKNOWN_0x{type_byte:02x}")
+
+
+def is_structurally_unknown(type_byte: int) -> bool:
+    """True if this type_byte should NOT be trusted as a real, well-framed
+    inner record. Used to suppress cursor advance + time-anchor
+    interpolation for misparse fragments and unrecognised wire tags.
+
+    Two cases:
+      - Type byte explicitly named `(not_in_enum_*)` in the RingEventType
+        enum (currently 0x33). These do exist as real records but their
+        framing isn't trustworthy for cursor / timestamp purposes.
+      - Type byte not in the enum at all (`UNKNOWN_0xXX`). Empirically
+        these are mid-stream byte-alignment misparses (e.g. 0x56) that
+        never appear at the start of a real notification.
+    """
+    name = canonical_type(type_byte)
+    return name.startswith("(not_in_enum_") or name.startswith("UNKNOWN_")
