@@ -14,7 +14,7 @@ across 40 unique captures (953,206 records). 0 decode errors.
 
 ### Live PPG, Heart Rate, Heart Rate Variability, SPO2, etc
 ![alt](images/example.PNG)
-**Raw Oura Ring data decoded live via BLE
+##Raw Oura Ring data decoded live via BLE
 ---
 
 ## Repository layout
