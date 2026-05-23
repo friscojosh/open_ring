@@ -1,0 +1,13 @@
+[Unit]
+Description=Install phone's LE Local IRK on host BLE adapter so the Oura ring accepts us
+After=bluetooth.service
+Wants=bluetooth.service
+ConditionFileNotEmpty=/etc/cc-ring/irk
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cc-ring-setup-irk
+RemainAfterExit=yes
+
+[Install]
+WantedBy=bluetooth.service
